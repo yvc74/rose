@@ -4,6 +4,7 @@ with Rose.Words;
 with Rose.Devices.Partitions;
 
 with Rose.Interfaces.Block_Device;
+with Rose.Interfaces.Constructor;
 with Rose.Interfaces.File_System;
 with Rose.Interfaces.Storage;
 with Rose.Interfaces.Timer;
@@ -42,6 +43,7 @@ package body Init.Run is
    Partition_Module : constant := 10;
    Elf_Module       : constant := 11;
    Timer_Module     : constant := 12;
+   Cap_Set_Module   : constant := 13;
 
    --------------
    -- Run_Init --
@@ -88,9 +90,12 @@ package body Init.Run is
       Page_On_Cap          : constant Rose.Capabilities.Capability :=
                                Init.Calls.Call
                                  (Create_Cap, (7, 1, 0, 0));
+
       Mem_Cap              : Rose.Capabilities.Capability;
-      Timer_Cap            : Rose.Capabilities.Capability;
+      Timer_Cap            : Rose.Capabilities.Capability := Null_Capability;
       PCI_Cap              : Rose.Capabilities.Capability;
+
+      Cap_Set_Cap          : Rose.Capabilities.Capability;
 
       Hd0_Cap              : Rose.Capabilities.Capability;
       Hd1_Cap              : Rose.Capabilities.Capability;
@@ -107,6 +112,9 @@ package body Init.Run is
       Active_Swap_Cap   : Rose.Capabilities.Capability := 0;
       Inactive_Swap_Cap : Rose.Capabilities.Capability := 0;
       Log_Cap           : Rose.Capabilities.Capability := 0;
+
+      Receive_Timeout  : Rose.Capabilities.Capability;
+      Send_Timeout     : Rose.Capabilities.Capability;
 
       function Copy_Cap_From_Process
         (Copy_Cap   : Rose.Capabilities.Capability;
@@ -128,6 +136,8 @@ package body Init.Run is
       is (Low = Rose.Devices.Partitions.Log_Id_Low
           and then High = Rose.Devices.Partitions.Log_Id_High);
 
+      procedure Wait (Milliseconds : Natural);
+
       ---------------------------
       -- Copy_Cap_From_Process --
       ---------------------------
@@ -138,7 +148,6 @@ package body Init.Run is
          Identifier : Rose.Objects.Capability_Identifier := 0)
          return Rose.Capabilities.Capability
       is
-
          Data : constant Init.Calls.Array_Of_Words :=
                   (Word_32 (Word_64 (Endpoint) mod 2 ** 32),
                    Word_32 (Word_64 (Endpoint) / 2 ** 32),
@@ -160,14 +169,24 @@ package body Init.Run is
             It := It / 16;
          end loop;
 
-         for I in 1 .. 4 loop
-            exit when Cap /= Null_Capability;
-            Init.Calls.Send_String
-              (Console_Write_Cap, Retry_Message);
-            Cap := Init.Calls.Call (Copy_Cap, Data);
-         end loop;
+         if Timer_Cap = Null_Capability then
+            for I in 1 .. 16 loop
+               exit when Cap /= Null_Capability;
+               Init.Calls.Send_String
+                 (Console_Write_Cap, Retry_Message);
+               Cap := Init.Calls.Call (Copy_Cap, Data);
+            end loop;
+         else
+            for I in 1 .. 4 loop
+               exit when Cap /= Null_Capability;
+               Init.Calls.Send_String
+                 (Console_Write_Cap, Retry_Message);
+               Wait (1000);
+               Cap := Init.Calls.Call (Copy_Cap, Data);
+            end loop;
+         end if;
 
-         if Cap = 0 then
+         if Cap = Null_Capability then
             if Console_Write_Cap /= Null_Capability then
                Init.Calls.Send_String
                  (Console_Write_Cap, Fail_Message);
@@ -233,8 +252,8 @@ package body Init.Run is
          Id :=
            Init.Calls.Launch_Boot_Module
              (Boot_Cap, Partition_Module, Device_Driver_Priority,
-              (Create_Endpoint_Cap,
-               Console_Write_Cap,
+              Create_Endpoint_Cap, Cap_Set_Cap,
+              (Console_Write_Cap,
                Device_Cap),
               (Rose.Words.Word (Start_Address),
                Rose.Words.Word (Start_Address + Length),
@@ -264,13 +283,28 @@ package body Init.Run is
 
       end Load_Partition;
 
+      ----------
+      -- Wait --
+      ----------
+
+      procedure Wait (Milliseconds : Natural) is
+         Control_Cap : constant Rose.Capabilities.Capability :=
+                         Init.Calls.Call
+                           (Timer_Cap, Send_Timeout,
+                            (1 => Rose.Words.Word (Milliseconds)));
+      begin
+         pragma Unreferenced (Control_Cap);
+         Init.Calls.Receive (Receive_Timeout);
+      end Wait;
+
    begin
       Init.Calls.Send (Reserve_Cap, (16#0000_1000#, 16#0009_F000#));
       Console_Id :=
         Init.Calls.Launch_Boot_Module
           (Boot_Cap, Console_Module, Low_Priority,
-           (Create_Endpoint_Cap,
-            Console_Mem_Cap,
+           Create_Endpoint_Cap,
+           Rose.Capabilities.Null_Capability,
+           (Console_Mem_Cap,
             Console_Cursor_Cap));
       Copy_Console_Cap :=
         Init.Calls.Call
@@ -281,10 +315,33 @@ package body Init.Run is
         Copy_Cap_From_Process (Copy_Console_Cap, 16#C025_0130#);
 
       declare
+         Cap_Set_Id : constant Rose.Objects.Object_Id :=
+                        Init.Calls.Launch_Boot_Module
+                          (Boot_Cap, Cap_Set_Module,
+                           Device_Driver_Priority,
+                           Create_Endpoint_Cap,
+                           Rose.Capabilities.Null_Capability,
+                           (1 => Console_Write_Cap));
+         Copy_Cap_Set_Cap : constant Rose.Capabilities.Capability :=
+                              Init.Calls.Call
+                                (Create_Cap,
+                                 (9, 1,
+                                  Word (Cap_Set_Id mod 2 ** 32),
+                                  Word (Cap_Set_Id / 2 ** 32)));
+      begin
+         Cap_Set_Cap :=
+           Copy_Cap_From_Process
+             (Copy_Cap_Set_Cap,
+              Rose.Interfaces.Constructor.Create_Endpoint);
+      end;
+
+      declare
          Mem_Id : constant Rose.Objects.Object_Id :=
                     Init.Calls.Launch_Boot_Module
                       (Boot_Cap, Mem_Module, Memory_Priority,
-                       (Create_Endpoint_Cap, Console_Write_Cap,
+                       Create_Endpoint_Cap,
+                       Cap_Set_Cap,
+                       (Console_Write_Cap,
                         Mem_Region_Count_Cap, Mem_Get_Region_Cap,
                         Page_On_Cap));
          Copy_Mem_Cap : constant Rose.Capabilities.Capability :=
@@ -310,8 +367,9 @@ package body Init.Run is
                                 (7, 7, 0, 0));
          Timer_Id       : constant Rose.Objects.Object_Id :=
                             Init.Calls.Launch_Boot_Module
-                              (Boot_Cap, Timer_Module, Device_Driver_Priority,
-                               (Create_Endpoint_Cap, Console_Write_Cap,
+                               (Boot_Cap, Timer_Module, Device_Driver_Priority,
+                                Create_Endpoint_Cap, Cap_Set_Cap,
+                               (Console_Write_Cap,
                                 Set_Timeout_Cap, Get_Ticks_Cap));
          Copy_Timeout_Cap : constant Rose.Capabilities.Capability :=
                               Init.Calls.Call
@@ -320,16 +378,8 @@ package body Init.Run is
                                   Word (Timer_Id mod 2 ** 32),
                                   Word (Timer_Id / 2 ** 32)));
          Timer_Caps       : Init.Calls.Array_Of_Capabilities (1 .. 2);
-         Receive_Timeout  : Rose.Capabilities.Capability;
-         Send_Timeout     : Rose.Capabilities.Capability;
          Control_Cap      : Rose.Capabilities.Capability with Unreferenced;
 
-         Waiting_For_Timeout_Message : constant String :=
-                                         "checking timeout server ..."
-                                         & NL;
-         Received_Timeout_Message    : constant String :=
-                                         "received timeout message"
-                                         & NL;
       begin
          Timer_Cap :=
            Copy_Cap_From_Process
@@ -339,7 +389,8 @@ package body Init.Run is
            (Cap         => Create_Endpoint_Cap,
             Data        =>
               (Rose.Words.Word_32
-                   (Rose.Interfaces.Timeout.On_Timeout_Endpoint mod 2 ** 32),
+                   (Rose.Interfaces.Timeout.On_Timeout_Endpoint
+                    mod 2 ** 32),
                Rose.Words.Word_32
                  (Rose.Interfaces.Timeout.On_Timeout_Endpoint / 2 ** 32)),
             Result_Caps => Timer_Caps);
@@ -347,21 +398,6 @@ package body Init.Run is
          Receive_Timeout := Timer_Caps (1);
          Send_Timeout := Timer_Caps (2);
 
-         Init.Calls.Send_String
-           (Console_Write_Cap, Waiting_For_Timeout_Message);
-
-         for I in 1 .. 3 loop
-            Control_Cap :=
-              Init.Calls.Call
-                (Timer_Cap, Send_Timeout,
-                 (1 => Rose.Words.Word (I * 1000)));
-         end loop;
-
-         for I in 1 .. 3 loop
-            Init.Calls.Receive (Receive_Timeout);
-            Init.Calls.Send_String
-              (Console_Write_Cap, Received_Timeout_Message);
-         end loop;
       end;
 
       declare
@@ -389,8 +425,8 @@ package body Init.Run is
          PCI_Id               : constant Rose.Objects.Object_Id :=
                                   Init.Calls.Launch_Boot_Module
                                     (Boot_Cap, PCI_Module, Low_Priority,
-                                     (Create_Endpoint_Cap,
-                                      Console_Write_Cap,
+                                     Create_Endpoint_Cap, Cap_Set_Cap,
+                                     (Console_Write_Cap,
                                       Command_Port_Out_Cap,
                                       Data_Port_Out_Cap,
                                       Data_Port_In_Cap));
@@ -442,18 +478,23 @@ package body Init.Run is
                                        16#0001_0001#,
                                        16#0000_01F0#,
                                        16#0000_01F7#));
-         Reserve_IRQ           : constant Rose.Capabilities.Capability :=
+         Reserve_Primary_IRQ   : constant Rose.Capabilities.Capability :=
                                    Init.Calls.Call
                                      (Create_Cap,
                                       (6, 1, 46, 0));
-         Ata_Id               : constant Rose.Objects.Object_Id :=
+         Reserve_Secondary_IRQ : constant Rose.Capabilities.Capability :=
+                                   Init.Calls.Call
+                                     (Create_Cap,
+                                      (6, 1, 47, 0));
+         Ata_Id                : constant Rose.Objects.Object_Id :=
                                    Init.Calls.Launch_Boot_Module
                                      (Boot_Cap, ATA_Module,
                                       Device_Driver_Priority,
-                                      (Create_Endpoint_Cap,
-                                       Console_Write_Cap,
+                                      Create_Endpoint_Cap, Cap_Set_Cap,
+                                      (Console_Write_Cap,
                                        PCI_Cap,
-                                       Reserve_IRQ,
+                                       Reserve_Primary_IRQ,
+                                       Reserve_Secondary_IRQ,
                                        Command_0_Cap,
                                        Control_0_Cap,
                                        Data_0_Cap_8,
@@ -486,8 +527,8 @@ package body Init.Run is
          Store_Id : constant Rose.Objects.Object_Id :=
                       Init.Calls.Launch_Boot_Module
                         (Boot_Cap, Store_Module, Device_Driver_Priority,
-                         (Create_Endpoint_Cap,
-                          Delete_Cap,
+                         Create_Endpoint_Cap, Cap_Set_Cap,
+                         (Delete_Cap,
                           Console_Write_Cap));
          Copy_Store_Cap : constant Rose.Capabilities.Capability :=
                             Init.Calls.Call
@@ -518,8 +559,8 @@ package body Init.Run is
          Elf_Id       : constant Rose.Objects.Object_Id :=
                             Init.Calls.Launch_Boot_Module
                               (Boot_Cap, Elf_Module, Device_Driver_Priority,
-                               (Create_Endpoint_Cap,
-                                Delete_Cap, Rescind_Cap,
+                               Create_Endpoint_Cap, Cap_Set_Cap,
+                               (Delete_Cap, Rescind_Cap,
                                 Console_Write_Cap,
                                 Mem_Cap, Create_Process_Cap));
          Copy_Elf_Cap : constant Rose.Capabilities.Capability :=
@@ -540,8 +581,8 @@ package body Init.Run is
          Scan_Id : constant Rose.Objects.Object_Id :=
                      Init.Calls.Launch_Boot_Module
                        (Boot_Cap, Scan_Module, File_System_Priority,
-                        (Create_Endpoint_Cap,
-                         Console_Write_Cap,
+                        Create_Endpoint_Cap, Cap_Set_Cap,
+                        (Console_Write_Cap,
                          Hd0_Cap));
          Copy_Scan_Cap : constant Rose.Capabilities.Capability :=
                            Init.Calls.Call
@@ -588,8 +629,8 @@ package body Init.Run is
          IsoFS_Id : constant Rose.Objects.Object_Id :=
                       Init.Calls.Launch_Boot_Module
                         (Boot_Cap, ISOFS_Module, File_System_Priority,
-                         (Create_Endpoint_Cap,
-                          Console_Write_Cap,
+                         Create_Endpoint_Cap, Cap_Set_Cap,
+                         (Console_Write_Cap,
                           Hd1_Cap));
          Copy_IsoFS_Cap : constant Rose.Capabilities.Capability :=
                             Init.Calls.Call
@@ -613,8 +654,8 @@ package body Init.Run is
          Restore_Id : constant Rose.Objects.Object_Id :=
                         Init.Calls.Launch_Boot_Module
                           (Boot_Cap, Restore_Module, File_System_Priority,
-                           (Create_Endpoint_Cap,
-                            Delete_Cap,
+                           Create_Endpoint_Cap, Cap_Set_Cap,
+                           (Delete_Cap,
                             Console_Write_Cap,
                             Active_Swap_Cap,
                             Inactive_Swap_Cap,

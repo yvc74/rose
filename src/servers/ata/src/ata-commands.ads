@@ -29,17 +29,23 @@ package ATA.Commands is
 
    function Send_Command
      (Drive        : ATA.Drives.ATA_Drive;
-      Command      : ATA_Command)
+      Command      : ATA_Command;
+      Log          : Boolean := False)
       return Boolean;
+
+   procedure Log_Command
+     (Drive   : ATA.Drives.ATA_Drive;
+      Message : String;
+      Command : ATA_Command);
 
    procedure Send_Control
      (Drive : ATA.Drives.ATA_Drive;
       Value : Rose.Words.Word_8);
 
-   function Wait_For_Status
-     (Drive     : ATA.Drives.ATA_Drive;
-      Mask      : ATA.Drives.ATA_Status;
-      Value     : ATA.Drives.ATA_Status)
+   function Poll_Status_Bits
+     (Drive : ATA.Drives.ATA_Drive;
+      Busy  : Boolean := False;
+      DRQ   : Boolean := False)
       return Boolean;
 
    procedure Read_Sectors
@@ -58,6 +64,8 @@ package ATA.Commands is
 
    procedure Flush
      (Drive : ATA.Drives.ATA_Drive);
+
+   function Current_Selected_Drive return ATA.Drives.ATA_Drive_Index;
 
 private
 

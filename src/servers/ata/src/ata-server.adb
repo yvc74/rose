@@ -8,6 +8,8 @@ with Rose.Objects;
 with Rose.Words;                       use Rose.Words;
 
 with Rose.Devices.PCI.Client;
+with Rose.Devices.Port_IO;
+
 with Rose.Console_IO;
 
 with Rose.Devices.Block;
@@ -23,9 +25,6 @@ package body ATA.Server is
    ATA_Native_1    : constant Rose.Words.Word_8 := 2#0000_0100#;
 
    Device_Cap  : Rose.Capabilities.Capability;
-
-   Master_Endpoint : constant := 16#A3AD_150D#;
-   Slave_Endpoint  : constant := 16#5C52_EAF3#;
 
    type Vendor_Device_Record is
       record
@@ -55,7 +54,41 @@ package body ATA.Server is
 
    procedure Create_Server is
       use type Rose.Capabilities.Capability;
+
+      procedure Next (Cap : out Rose.Capabilities.Capability);
+
+      ----------
+      -- Next --
+      ----------
+
+      procedure Next (Cap : out Rose.Capabilities.Capability) is
+      begin
+         Cap := Rose.System_Calls.Client.Get_Capability (Take_Next_Cap);
+      end Next;
+
    begin
+
+      Next (Console_Cap);
+      Rose.Console_IO.Open (Console_Cap);
+      Rose.Console_IO.Put_Line ("ata: creating server");
+
+      Next (PCI_Cap);
+      Next (Primary_IRQ_Cap);
+      Next (Secondary_IRQ_Cap);
+
+      Next (Command_0_Cap);
+      Next (Control_0_Cap);
+      Next (Data_0_Cap_8);
+      Next (Data_0_Cap_Read_16);
+      Next (Data_0_Cap_Write_16);
+
+      Next (Command_1_Cap);
+      Next (Control_1_Cap);
+      Next (Data_1_Cap_8);
+      Next (Data_1_Cap_Read_16);
+      Next (Data_1_Cap_Write_16);
+
+      Next (Set_Timeout_Cap);
 
       Device_Cap := Rose.Capabilities.Null_Capability;
 
@@ -194,18 +227,26 @@ package body ATA.Server is
    ------------------
 
    procedure Start_Server is
-      Receive_Cap : constant Rose.Capabilities.Capability :=
-                      Rose.System_Calls.Server.Create_Receive_Cap
-                        (Create_Endpoint_Cap);
-      Interrupt_Cap : constant Rose.Capabilities.Capability :=
-                        Rose.System_Calls.Server.Create_Endpoint
-                          (Create_Endpoint_Cap, Master_Endpoint);
-      Params      : aliased Rose.Invocation.Invocation_Record;
-      Reply       : aliased Rose.Invocation.Invocation_Record;
+      Receive_Cap             : constant Rose.Capabilities.Capability :=
+                                  Rose.System_Calls.Server.Create_Receive_Cap
+                                    (Create_Endpoint_Cap);
+      Primary_Interrupt_Cap   : constant Rose.Capabilities.Capability :=
+                                  Rose.System_Calls.Server.Create_Endpoint
+                                    (Create_Endpoint_Cap, Primary_Endpoint);
+      Secondary_Interrupt_Cap : constant Rose.Capabilities.Capability :=
+                                  Rose.System_Calls.Server.Create_Endpoint
+                                    (Create_Endpoint_Cap, Secondary_Endpoint);
+      Params                  : aliased Rose.Invocation.Invocation_Record;
+      Reply                   : aliased Rose.Invocation.Invocation_Record;
+      Send_Reply              : Boolean;
    begin
 
-      Rose.System_Calls.Initialize_Send (Params, Reserve_IRQ_Cap);
-      Rose.System_Calls.Send_Cap (Params, Interrupt_Cap);
+      Rose.System_Calls.Initialize_Send (Params, Primary_IRQ_Cap);
+      Rose.System_Calls.Send_Cap (Params, Primary_Interrupt_Cap);
+      Rose.System_Calls.Invoke_Capability (Params);
+
+      Rose.System_Calls.Initialize_Send (Params, Secondary_IRQ_Cap);
+      Rose.System_Calls.Send_Cap (Params, Secondary_Interrupt_Cap);
       Rose.System_Calls.Invoke_Capability (Params);
 
       Rose.System_Calls.Server.Create_Anonymous_Endpoint
@@ -228,11 +269,11 @@ package body ATA.Server is
          Rose.Interfaces.Block_Device.Write_Blocks_Endpoint);
 
       loop
+         Send_Reply := True;
          Params := (others => <>);
          Params.Control.Flags (Rose.Invocation.Receive) := True;
          Params.Control.Flags (Rose.Invocation.Block) := True;
          Params.Control.Flags (Rose.Invocation.Recv_Words) := True;
-         Params.Control.Flags (Rose.Invocation.Recv_Buffer) := True;
          Params.Control.Last_Recv_Word :=
            Rose.Invocation.Parameter_Word_Index'Last;
          Params.Cap := Receive_Cap;
@@ -242,10 +283,33 @@ package body ATA.Server is
          Rose.System_Calls.Initialize_Reply (Reply, Params.Reply_Cap);
 
          case Params.Endpoint is
-            when Master_Endpoint =>
-               Rose.Console_IO.Put_Line ("interrupt on master");
-            when Slave_Endpoint =>
-               Rose.Console_IO.Put_Line ("interrupt on slave");
+            when Primary_Endpoint =>
+               declare
+                  use ATA.Drives;
+                  Drive : constant ATA_Drive :=
+                            Get (ATA.Commands.Current_Selected_Drive);
+                  Status : constant ATA_Status :=
+                             ATA_Status
+                               (Rose.Devices.Port_IO.Port_In_8
+                                  (Data_8_Port (Drive), 7));
+               begin
+                  if (Status and Status_Error) /= 0 then
+                     Rose.Console_IO.Put ("IRQ: primary: status=");
+                     Rose.Console_IO.Put (Rose.Words.Word_8 (Status));
+                     Rose.Console_IO.Put ("; error = ");
+                     Rose.Console_IO.Put
+                       (Rose.Devices.Port_IO.Port_In_8
+                          (Data_8_Port (Drive), 1));
+                     Rose.Console_IO.New_Line;
+                     Log (Drive, "error detected after interrupt");
+                  end if;
+               end;
+
+               Send_Reply := False;
+
+            when Secondary_Endpoint =>
+               Rose.Console_IO.Put_Line ("secondary interrupt");
+               Send_Reply := False;
             when Rose.Interfaces.Get_Interface_Endpoint =>
                declare
                   Get_Parameters_Cap : Rose.Capabilities.Capability;
@@ -385,7 +449,9 @@ package body ATA.Server is
 
          end case;
 
-         Rose.System_Calls.Invoke_Capability (Reply);
+         if Send_Reply then
+            Rose.System_Calls.Invoke_Capability (Reply);
+         end if;
 
       end loop;
    end Start_Server;

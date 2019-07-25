@@ -2,7 +2,7 @@ with Rose.Capabilities.Layout;
 with Rose.Invocation;
 
 with Rose.Boot.Console;
-with Rose.Kernel.Processes.Debug;
+with Rose.Kernel.Processes;
 
 package body Rose.Kernel.Interrupts is
 
@@ -67,35 +67,18 @@ package body Rose.Kernel.Interrupts is
       Argument  : Rose.Words.Word)
       return Interrupt_Handler_Status
    is
-      use Rose.Arch.Interrupts;
       It        : Interrupt_Handler_Access := Interrupt_Table (Interrupt);
       State     : Interrupt_Handler_Status := Finished;
       New_State : Interrupt_Handler_Status;
-      Page_Fault_Address : Rose.Words.Word_32;
-      pragma Import (C, Page_Fault_Address, "page_fault_address");
    begin
-
-      if Interrupt /= Clock_Interrupt
-        and then Interrupt /= Page_Fault
-      then
-         Rose.Boot.Console.Put ("handle-interrupt: vector = ");
-         Rose.Boot.Console.Put (Rose.Words.Word_8 (Interrupt));
-         Rose.Boot.Console.Put (" code = ");
-         Rose.Boot.Console.Put (Argument);
-         Rose.Boot.Console.New_Line;
-      end if;
 
       if It = null then
          Rose.Boot.Console.Put ("kernel: ");
          Rose.Boot.Console.Put (Rose.Words.Word_8 (Interrupt));
          Rose.Boot.Console.Put (" ");
          Rose.Boot.Console.Put (Argument);
-         Rose.Boot.Console.Put (" ");
-         Rose.Boot.Console.Put (Page_Fault_Address);
          Rose.Boot.Console.Put (": no handler                       ");
          Rose.Boot.Console.New_Line;
-         Rose.Kernel.Processes.Debug.Report_Process
-           (Rose.Kernel.Processes.Current_Process_Id);
       end if;
 
       while It /= null loop
@@ -110,7 +93,7 @@ package body Rose.Kernel.Interrupts is
             when Capability_Handler =>
                Send_Interrupt_Cap
                  (It.Handler_Object, It.Handler_Cap, Argument);
-               New_State := Not_Finished;
+               New_State := Finished;
          end case;
          if New_State = Not_Finished then
             State := New_State;
@@ -178,8 +161,7 @@ package body Rose.Kernel.Interrupts is
    is
    begin
       if Interrupt_Table (Interrupt) = null then
-         Interrupt_Table (Interrupt) :=
-           Interrupt_Handler_Table (Interrupt_Handler_Count)'Access;
+         Interrupt_Table (Interrupt) := Handler;
       else
          declare
             It : Interrupt_Handler_Access :=

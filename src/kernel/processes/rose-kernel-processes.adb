@@ -9,6 +9,7 @@ with Rose.Kernel.Processes;
 with Rose.Kernel.Heap;
 
 with Rose.Kernel.Panic;
+with Rose.Invocation.Trace;
 
 package body Rose.Kernel.Processes is
 
@@ -412,6 +413,18 @@ package body Rose.Kernel.Processes is
       Layout := P.Cached_Caps (Load_Cap (Pid, Cap)).Layout;
    end Get_Cap;
 
+   ----------------------------
+   -- Get_Current_Invocation --
+   ----------------------------
+
+   procedure Get_Current_Invocation
+     (Pid        : Process_Id;
+      Invocation : out Rose.Invocation.Invocation_Record)
+   is
+   begin
+      Invocation := Process_Table (Pid).Current_Params;
+   end Get_Current_Invocation;
+
    ----------------------
    -- Get_Process_Name --
    ----------------------
@@ -476,7 +489,7 @@ package body Rose.Kernel.Processes is
             Addr    => Virtual_Address);
       end if;
 
-      if Log_Page_Faults or else Trace (Current_Process_Id) then
+      if Log_Page_Faults and then Trace (Current_Process_Id) then
          Rose.Boot.Console.Put ("page-fault: ");
          Rose.Boot.Console.Put ("pid ");
          Rose.Boot.Console.Put (Rose.Words.Word_8 (Current_Process_Id));
@@ -603,6 +616,23 @@ package body Rose.Kernel.Processes is
          return Layout.Header.Cap_Type /= Null_Cap;
       end if;
    end Has_Cap;
+
+   ------------------------
+   -- Has_Queued_Message --
+   ------------------------
+
+   function Has_Queued_Message
+     (Process     : Process_Id;
+      Endpoint    : Rose.Objects.Endpoint_Index)
+      return Boolean
+   is
+      use type Rose.Objects.Endpoint_Index;
+      P : Kernel_Process_Entry renames Process_Table (Process);
+   begin
+      return P.Flags (Message_Queued)
+        and then (Endpoint = 0
+                  or else Endpoint = P.Queued_Endpoint);
+   end Has_Queued_Message;
 
    ---------------------------
    -- Have_Process_Handlers --
@@ -958,14 +988,31 @@ package body Rose.Kernel.Processes is
    -------------------------
 
    function Next_Blocked_Sender
-     (Receiver_Id : Process_Id)
+     (Receiver_Id : Process_Id;
+      Endpoint    : Rose.Objects.Endpoint_Index)
       return Process_Id
    is
-      It   : constant Kernel_Process_Access :=
+      use type Rose.Objects.Endpoint_Index;
+      It   : Kernel_Process_Access :=
                Process_Table (Receiver_Id).Waiting_First;
+      Prev : Kernel_Process_Access := null;
    begin
+      if Endpoint /= 0 then
+         while It /= null
+           and then It.Waiting_Endpoint /= Endpoint
+         loop
+            Prev := It;
+            It := It.Waiting_Next;
+         end loop;
+      end if;
+
       if It /= null then
-         Process_Table (Receiver_Id).Waiting_First := It.Waiting_Next;
+         if Prev = null then
+            Process_Table (Receiver_Id).Waiting_First := It.Waiting_Next;
+         else
+            Prev.Waiting_Next := It.Waiting_Next;
+         end if;
+
          It.Waiting_Next := null;
          return It.Pid;
       end if;
@@ -1182,9 +1229,51 @@ package body Rose.Kernel.Processes is
 
       end if;
 
+      if Trace (To_Process_Id) then
+         Debug.Put (To_Process_Id);
+         Rose.Boot.Console.Put (": sending message");
+         Rose.Boot.Console.Put (": cap=");
+         Rose.Boot.Console.Put (Natural (To.Current_Params.Cap));
+         Rose.Boot.Console.New_Line;
+         Rose.Invocation.Trace.Put (To.Current_Params, True);
+      end if;
+
       Set_Current_State (To_Process_Id, Ready);
 
    end Send_Cap;
+
+   -------------------------
+   -- Send_Queued_Message --
+   -------------------------
+
+   procedure Send_Queued_Message
+     (Process : Process_Id)
+   is
+      To   : Kernel_Process_Entry renames Process_Table (Process);
+   begin
+      if To.Flags (Trace) then
+         Debug.Put (Process);
+         Rose.Boot.Console.Put (": sending queued message");
+         Rose.Boot.Console.Put (": cap=");
+         Rose.Boot.Console.Put (Natural (To.Queued_Params.Cap));
+         Rose.Boot.Console.Put ("; ep=");
+         Rose.Boot.Console.Put (Rose.Words.Word_32 (To.Queued_Endpoint));
+         Rose.Boot.Console.Put ("; id=");
+         Rose.Boot.Console.Put (Natural (To.Queued_Cap_Id));
+         Rose.Boot.Console.New_Line;
+         Rose.Invocation.Trace.Put (To.Queued_Params, True);
+      end if;
+
+      To.Flags (Message_Queued) := False;
+      Send_To_Endpoint
+        (From_Process_Id => 1,
+         To_Process_Id   => Process,
+         Sender_Cap      => To.Queued_Params.Cap,
+         Endpoint        => To.Queued_Endpoint,
+         Identifier      => To.Queued_Cap_Id,
+         Params          => To.Queued_Params);
+
+   end Send_Queued_Message;
 
    ----------------
    -- Send_Reply --
@@ -1268,11 +1357,39 @@ package body Rose.Kernel.Processes is
       if Endpoint in To.Endpoints'Range
         and then To.Endpoints (Endpoint).Endpoint /= 0
       then
-         Send_Cap (From_Process_Id, To_Process_Id,
-                   Sender_Cap, Sender_Cap,
-                   (Params with delta
-                      Endpoint => To.Endpoints (Endpoint).Endpoint,
-                      Identifier => Identifier));
+         declare
+            Send_Params : constant Rose.Invocation.Invocation_Record :=
+                            (Params with delta
+                               Endpoint   => To.Endpoints (Endpoint).Endpoint,
+                               Identifier => Identifier);
+         begin
+            case Current_State (To_Process_Id) is
+               when Blocked =>
+                  Send_Cap (From_Process_Id, To_Process_Id,
+                            Sender_Cap, Sender_Cap, Send_Params);
+               when Available | Faulted | Killed =>
+                  Debug.Put (From_Process_Id);
+                  Rose.Boot.Console.Put ("->");
+                  Debug.Put (To_Process_Id);
+                  Rose.Boot.Console.Put (": to cannot accept messages");
+                  Rose.Boot.Console.New_Line;
+               when Starting | Ready | Running | Interrupted =>
+                  if To.Flags (Message_Queued) then
+                     Rose.Boot.Console.Put_Line ("lost queued message");
+                  end if;
+
+                  To.Queued_Params := Send_Params;
+                  To.Queued_Endpoint := Endpoint;
+                  To.Queued_Cap_Id := Identifier;
+                  To.Flags (Message_Queued) := True;
+
+                  if To.Flags (Trace) then
+                     Debug.Put (To_Process_Id);
+                     Rose.Boot.Console.Put_Line (": message queued");
+                     Rose.Invocation.Trace.Put (To.Queued_Params, True);
+                  end if;
+            end case;
+         end;
          return;
       else
          Rose.Boot.Console.Put ("bad endpoint: ");
@@ -1500,6 +1617,24 @@ package body Rose.Kernel.Processes is
       Set_Current_State (Process, Ready);
       Rose.Kernel.Processes.Queue.Queue_Process (Process);
    end Start_Process;
+
+   -----------------
+   -- Start_Trace --
+   -----------------
+
+   procedure Start_Trace (Process : Process_Id) is
+   begin
+      Process_Table (Process).Flags (Trace) := True;
+   end Start_Trace;
+
+   ----------------
+   -- Stop_Trace --
+   ----------------
+
+   procedure Stop_Trace (Process : Process_Id) is
+   begin
+      Process_Table (Process).Flags (Trace) := False;
+   end Stop_Trace;
 
    -------------------
    -- To_Process_Id --
